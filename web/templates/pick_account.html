@@ -21,9 +21,9 @@
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
   </span>
   {{if .Renewing}}
-  <span>Your bank returned more than one account, and none of them could be matched to <strong>{{.RenewingName}}</strong> automatically. Choose the one that is <strong>{{.RenewingName}}</strong>. It keeps its {{.BackendLabel}} account and its import history.</span>
+  <span>Select every account you want connected through this authorization. Use the radio option to identify which returned account replaces <strong>{{.RenewingName}}</strong>; it keeps its {{.BackendLabel}} account and import history.</span>
   {{else}}
-  <span>Choose the bank account to sync and the {{.BackendLabel}} account it should import into.</span>
+  <span>Choose one or more bank accounts to sync. Each selected account uses this authorization session.</span>
   {{end}}
 </div>
 
@@ -36,50 +36,69 @@
   <p class="section-label">Available accounts</p>
 
   {{range .Accounts}}
+  <div class="account-choice" data-connected="{{.Connected}}">
   <label class="acct-card">
-    <input type="radio" name="account_uid" value="{{.EffectiveUID}}" data-suggest="{{.Suggested}}" required>
+    <input type="checkbox" name="account_uid" value="{{.EffectiveUID}}" {{if .Selected}}checked{{end}}>
     <div>
       <div style="font-size:.88rem;font-weight:500;color:var(--text)">{{.Label}}</div>
       {{with .Describe}}<div style="font-size:.75rem;color:var(--muted);margin-top:.15rem">{{.}}</div>{{end}}
       {{if ne .Label .EffectiveUID}}<span class="acct-uid">{{.EffectiveUID}}</span>{{end}}
     </div>
   </label>
+  {{if $.Renewing}}
+  <label class="field-hint" style="display:block;margin:-.1rem 0 .7rem 2.8rem">
+    <input type="radio" name="renew_account_uid" value="{{.EffectiveUID}}" {{if .RenewTarget}}checked{{end}} required>
+    This is {{$.RenewingName}}
+  </label>
   {{end}}
-
-  {{if not .Renewing}}
-  <hr class="divider">
-
-  <div class="field">
-    <label for="target-account">{{.BackendLabel}} Account</label>
-    <input type="text" id="target-account" name="actual_account" value="{{.DefaultAccount}}" placeholder="Leave empty to name it after the bank account" list="known-accounts">
-    <datalist id="known-accounts">{{range .KnownAccounts}}<option value="{{.}}"></option>{{end}}</datalist>
-    <p class="field-hint">The account name in {{.BackendLabel}} where transactions from this bank will be imported. Pick an existing one where possible &mdash; a new name creates a new account. Left empty, it is named after the bank account you selected above.{{if .RenameSafe}} You can rename it in {{.BackendLabel}} later; it is matched by IBAN, not by name.{{end}}</p>
-  </div>
-
-  <div class="field">
-    <label for="start-sync-date">Import transactions from</label>
-    <input id="start-sync-date" type="date" name="start_sync_date" value="{{.DefaultStartDate}}">
-    <p class="field-hint">Transactions from this date onwards will be imported on the first sync. Leave as-is for the last 30 days.</p>
+  <p class="account-preserved field-hint" style="margin:0 0 1.5rem 2.8rem" {{if not (or .Connected .RenewTarget)}}hidden{{end}}>This connected account keeps its name, sync start date, and import history.</p>
+  <fieldset class="account-config" style="border:0;padding:0;margin:0 0 1.5rem 2.8rem" {{if or .Connected .RenewTarget}}hidden disabled{{end}}>
+    <div class="field">
+      <label for="target-account-{{.EffectiveUID}}">{{$.BackendLabel}} Account</label>
+      <input type="text" id="target-account-{{.EffectiveUID}}" name="actual_account[{{.EffectiveUID}}]" value="{{.AccountName}}" placeholder="Leave empty to use the suggested account name" list="known-accounts">
+      <p class="field-hint">The target name for this bank account.{{if $.RenameSafe}} You can rename it in {{$.BackendLabel}} later; it is matched by IBAN.{{end}}</p>
+    </div>
+    <div class="field">
+      <label for="start-sync-date-{{.EffectiveUID}}">Import transactions from</label>
+      <input id="start-sync-date-{{.EffectiveUID}}" type="date" name="start_sync_date[{{.EffectiveUID}}]" value="{{.StartDate}}">
+      <p class="field-hint">The first sync imports this account's transactions from this date onwards.</p>
+    </div>
+  </fieldset>
   </div>
   {{end}}
+  <datalist id="known-accounts">{{range .KnownAccounts}}<option value="{{.}}"></option>{{end}}</datalist>
 
   <div class="mt-lg">
     <button type="submit" class="btn btn-primary">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
-      {{if .Renewing}}Renew this account{{else}}Use this account{{end}}
+      {{if .Renewing}}Renew selected accounts{{else}}Use selected accounts{{end}}
     </button>
   </div>
 </form>
 
 <script>
 (function () {
-  var field = document.getElementById('target-account');
-  if (!field) return;
-  var edited = field.value !== '';
-  field.addEventListener('input', function () { edited = true; });
-  document.querySelectorAll('input[name="account_uid"]').forEach(function (radio) {
+  function updateFields(checkbox) {
+    var choice = checkbox.closest('.account-choice');
+    var fields = choice.querySelector('.account-config');
+    var renewal = document.querySelector('input[name="renew_account_uid"]:checked');
+    var preserved = choice.dataset.connected === 'true' || (renewal && renewal.value === checkbox.value);
+    fields.hidden = !checkbox.checked || preserved;
+    fields.disabled = !checkbox.checked || preserved;
+    choice.querySelector('.account-preserved').hidden = !checkbox.checked || !preserved;
+  }
+  document.querySelectorAll('input[name="account_uid"]').forEach(function (checkbox) {
+    updateFields(checkbox);
+    checkbox.addEventListener('change', function () { updateFields(checkbox); });
+  });
+  document.querySelectorAll('input[name="renew_account_uid"]').forEach(function (radio) {
     radio.addEventListener('change', function () {
-      if (!edited) field.value = radio.dataset.suggest || '';
+      document.querySelectorAll('input[name="account_uid"]').forEach(function (checkbox) {
+        if (checkbox.value === radio.value) {
+          checkbox.checked = true;
+        }
+        updateFields(checkbox);
+      });
     });
   });
 })();

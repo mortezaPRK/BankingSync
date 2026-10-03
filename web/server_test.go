@@ -335,6 +335,116 @@ func TestHandlePickAccount_POST_savesActualAccount(t *testing.T) {
 	}
 }
 
+func TestHandlePickAccount_POST_individualAccountSettings(t *testing.T) {
+	srv, st := newTestServer(t)
+	_ = st.SetSetting("pending_auth_session_id", "shared-session")
+	_ = st.SetSetting("pending_auth_accounts", `[{"uid":"checking","name":"Checking"},{"uid":"savings","name":"Savings"},{"uid":"unselected"}]`)
+	_ = st.SetSetting("pending_auth_bank_name", "TestBank")
+	_ = st.SetSetting("pending_auth_bank_country", "DE")
+
+	w := post(t, srv, "/pick-account", url.Values{
+		"account_uid":                 {"checking", "savings"},
+		"actual_account[checking]":    {" Daily expenses "},
+		"start_sync_date[checking]":   {"2026-01-01"},
+		"actual_account[savings]":     {"Emergency fund"},
+		"start_sync_date[savings]":    {"2026-07-15"},
+		"actual_account[unselected]":  {"Do not connect"},
+		"start_sync_date[unselected]": {"2020-01-01"},
+	})
+	if w.Code != http.StatusFound {
+		t.Fatalf("got %d: %s", w.Code, w.Body.String())
+	}
+	accounts, err := st.GetAllBankAccounts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accounts) != 2 {
+		t.Fatalf("got %d accounts, want 2", len(accounts))
+	}
+	want := map[string]struct{ name, date string }{
+		"checking": {"Daily expenses", "2026-01-01"},
+		"savings":  {"Emergency fund", "2026-07-15"},
+	}
+	for _, account := range accounts {
+		expected, ok := want[account.AccountUID]
+		if !ok || account.ActualAccount != expected.name || account.StartSyncDate != expected.date || account.SessionID != "shared-session" {
+			t.Errorf("unexpected account settings: %+v", account)
+		}
+	}
+}
+
+func TestHandlePickAccount_POST_blankIndividualSettingsUseDefaults(t *testing.T) {
+	srv, st := newTestServer(t)
+	_ = st.SetSetting("pending_auth_session_id", "shared-session")
+	_ = st.SetSetting("pending_auth_accounts", `[{"uid":"checking","name":"Checking"}]`)
+	_ = st.SetSetting("pending_auth_bank_name", "TestBank")
+	w := post(t, srv, "/pick-account", url.Values{
+		"account_uid":               {"checking"},
+		"actual_account[checking]":  {""},
+		"start_sync_date[checking]": {""},
+		"actual_account":            {"Shared legacy name"},
+		"start_sync_date":           {"2000-01-01"},
+	})
+	if w.Code != http.StatusFound {
+		t.Fatalf("got %d: %s", w.Code, w.Body.String())
+	}
+	accounts, err := st.GetAllBankAccounts()
+	if err != nil || len(accounts) != 1 {
+		t.Fatalf("accounts: %v, error: %v", accounts, err)
+	}
+	if accounts[0].ActualAccount != "TestBank Checking" || accounts[0].StartSyncDate != time.Now().UTC().AddDate(0, 0, -30).Format("2006-01-02") {
+		t.Errorf("blank individual fields did not use defaults: %+v", accounts[0])
+	}
+}
+
+func TestHandlePickAccount_POST_individualSettingsDuringRenewal(t *testing.T) {
+	srv, st := newTestServer(t)
+	id, err := st.AddBankAccount(store.NewBankAccount{
+		SessionID: "old-session", AccountUID: "old-checking", BankName: "TestBank", BankCountry: "DE",
+		ActualAccount: "Existing checking", StartSyncDate: "2025-01-01", IdentificationHash: "checking-hash",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.SetSetting("pending_auth_renew_account_id", strconv.FormatInt(id, 10))
+	_ = st.SetSetting("pending_auth_session_id", "new-session")
+	_ = st.SetSetting("pending_auth_accounts", `[{"uid":"checking","identification_hash":"checking-hash"},{"uid":"savings","identification_hash":"savings-hash"}]`)
+	_ = st.SetSetting("pending_auth_bank_name", "TestBank")
+	_ = st.SetSetting("pending_auth_bank_country", "DE")
+	w := post(t, srv, "/pick-account", url.Values{
+		"account_uid":               {"checking", "savings"},
+		"renew_account_uid":         {"checking"},
+		"actual_account[savings]":   {"New savings"},
+		"start_sync_date[savings]":  {"2026-08-01"},
+		"actual_account[checking]":  {"Do not rename"},
+		"start_sync_date[checking]": {"2026-10-01"},
+	})
+	if w.Code != http.StatusFound {
+		t.Fatalf("got %d: %s", w.Code, w.Body.String())
+	}
+	accounts, err := st.GetAllBankAccounts()
+	if err != nil || len(accounts) != 2 {
+		t.Fatalf("accounts: %v, error: %v", accounts, err)
+	}
+	for _, account := range accounts {
+		if account.SessionID != "new-session" {
+			t.Errorf("account did not share the new session: %+v", account)
+		}
+		switch account.AccountUID {
+		case "checking":
+			if account.ID != id || account.ActualAccount != "Existing checking" || account.StartSyncDate != "2025-01-01" {
+				t.Errorf("renewal changed existing settings: %+v", account)
+			}
+		case "savings":
+			if account.ActualAccount != "New savings" || account.StartSyncDate != "2026-08-01" {
+				t.Errorf("new account did not retain its own settings: %+v", account)
+			}
+		default:
+			t.Errorf("unexpected account: %+v", account)
+		}
+	}
+}
+
 // --- handleRemoveAccount ----------------------------------------------------
 
 func TestHandleRemoveAccount_GET_returns404(t *testing.T) {

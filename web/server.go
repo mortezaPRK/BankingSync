@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -522,6 +523,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_ = s.st.SetSetting("pending_session_state", stateUUID)
 	_ = s.st.SetSetting("pending_bank_name", bankName)
 	_ = s.st.SetSetting("pending_bank_country", bankCountry)
+	_ = s.st.SetSetting("pending_renew_account_id", "")
 	_ = s.st.SetSetting("pending_auth_url", "")
 
 	appBaseURL := detectBaseURL(r, s.st)
@@ -611,20 +613,16 @@ func (s *Server) finishAuth(w http.ResponseWriter, r *http.Request, sr *enableba
 	_ = s.st.SetSetting("pending_renew_account_id", "")
 	_ = s.st.SetSetting("pending_auth_url", "")
 
+	renewUID := ""
 	if renewAccountID != "" {
 		id, err := strconv.ParseInt(renewAccountID, 10, 64)
 		existing, found := s.bankAccount(id)
 		if err != nil || !found {
-			http.Redirect(w, r, "/connect?error="+urlEncode("Renewal failed: the account being renewed no longer exists"), http.StatusFound)
-			return
-		}
-		if a, ok := matchRenewal(existing, sr.Accounts); ok {
-			if err := s.st.RenewBankAccountSession(id, renewalFrom(a, sr.SessionID, expiry)); err != nil {
-				http.Redirect(w, r, "/connect?error="+urlEncode("Renewal failed: "+err.Error()), http.StatusFound)
-				return
-			}
-			http.Redirect(w, r, "/status", http.StatusFound)
-			return
+			// The account may have been removed while bank authorisation was in
+			// progress. The completed session is still useful as a new connection.
+			renewAccountID = ""
+		} else if a, ok := matchRenewal(existing, sr.Accounts); ok {
+			renewUID = a.EffectiveUID()
 		}
 	}
 
@@ -635,6 +633,7 @@ func (s *Server) finishAuth(w http.ResponseWriter, r *http.Request, sr *enableba
 	_ = s.st.SetSetting("pending_auth_expiry", expiry)
 	_ = s.st.SetSetting("pending_auth_bank_name", bankName)
 	_ = s.st.SetSetting("pending_auth_bank_country", bankCountry)
+	_ = s.st.SetSetting("pending_auth_renew_uid", renewUID)
 
 	http.Redirect(w, r, "/pick-account", http.StatusFound)
 }
@@ -716,6 +715,16 @@ func findAccount(accounts []enablebanking.SessionAccount, uid string) (enableban
 // It reports false rather than guess when the evidence names no account or more
 // than one; the caller then asks which one it is.
 func matchRenewal(existing store.BankAccount, offered []enablebanking.SessionAccount) (enablebanking.SessionAccount, bool) {
+	if a, ok := matchAccountIdentity(existing, offered); ok {
+		return a, true
+	}
+	if len(offered) == 1 {
+		return offered[0], true
+	}
+	return enablebanking.SessionAccount{}, false
+}
+
+func matchAccountIdentity(existing store.BankAccount, offered []enablebanking.SessionAccount) (enablebanking.SessionAccount, bool) {
 	if existing.IdentificationHash != "" && offersAny(offered, func(a enablebanking.SessionAccount) string { return a.IdentificationHash }) {
 		return only(offered, func(a enablebanking.SessionAccount) bool {
 			return a.IdentificationHash == existing.IdentificationHash
@@ -726,9 +735,6 @@ func matchRenewal(existing store.BankAccount, offered []enablebanking.SessionAcc
 			return a.IBAN == existing.IBAN &&
 				(existing.Currency == "" || a.Currency == "" || strings.EqualFold(a.Currency, existing.Currency))
 		})
-	}
-	if len(offered) == 1 {
-		return offered[0], true
 	}
 	return enablebanking.SessionAccount{}, false
 }
@@ -795,6 +801,7 @@ func (s *Server) handlePickAccount(w http.ResponseWriter, r *http.Request) {
 		RenameSafe       bool
 		Renewing         bool
 		RenewingName     string
+		RenewUID         string
 		Error            string
 	}
 
@@ -816,19 +823,60 @@ func (s *Server) handlePickAccount(w http.ResponseWriter, r *http.Request) {
 	expiry, _ := s.st.GetSetting("pending_auth_expiry")
 	bankName, _ := s.st.GetSetting("pending_auth_bank_name")
 	bankCountry, _ := s.st.GetSetting("pending_auth_bank_country")
+	renewUID, _ := s.st.GetSetting("pending_auth_renew_uid")
 	defaultAccount := s.defaultBudgetAccount()
 	defaultStart := time.Now().UTC().AddDate(0, 0, -30).Format("2006-01-02")
 
 	var accounts []enablebanking.SessionAccount
 	_ = json.Unmarshal([]byte(accountsJSON), &accounts)
+	accountsBeforeAdd, err := s.st.GetAllBankAccounts()
+	if err != nil {
+		http.Error(w, "Failed to load connected accounts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	type pickable struct {
 		enablebanking.SessionAccount
-		Suggested string
+		Suggested   string
+		RenewTarget bool
+		AccountName string
+		StartDate   string
+		Selected    bool
+		Connected   bool
 	}
 	pickables := make([]pickable, 0, len(accounts))
 	for _, a := range accounts {
-		pickables = append(pickables, pickable{SessionAccount: a, Suggested: a.SuggestedAccountName(bankName)})
+		accountName := defaultAccount
+		if accountName == "" {
+			accountName = a.SuggestedAccountName(bankName)
+		}
+		startDate := defaultStart
+		selected := a.EffectiveUID() == renewUID
+		if r.Method == http.MethodPost {
+			accountName = r.FormValue("actual_account[" + a.EffectiveUID() + "]")
+			startDate = r.FormValue("start_sync_date[" + a.EffectiveUID() + "]")
+			selected = slices.Contains(r.PostForm["account_uid"], a.EffectiveUID())
+		}
+		connected := false
+		for _, existing := range accountsBeforeAdd {
+			if !strings.EqualFold(strings.TrimSpace(existing.BankName), strings.TrimSpace(bankName)) ||
+				!strings.EqualFold(strings.TrimSpace(existing.BankCountry), strings.TrimSpace(bankCountry)) {
+				continue
+			}
+			if matched, ok := matchAccountIdentity(existing, accounts); ok && matched.EffectiveUID() == a.EffectiveUID() {
+				connected = true
+				break
+			}
+		}
+		pickables = append(pickables, pickable{
+			SessionAccount: a,
+			Suggested:      a.SuggestedAccountName(bankName),
+			RenewTarget:    a.EffectiveUID() == renewUID,
+			AccountName:    accountName,
+			StartDate:      startDate,
+			Selected:       selected,
+			Connected:      connected,
+		})
 	}
 
 	if r.Method == http.MethodGet {
@@ -846,14 +894,33 @@ func (s *Server) handlePickAccount(w http.ResponseWriter, r *http.Request) {
 			RenameSafe:       s.renameSafeBackend(),
 			Renewing:         isRenewal,
 			RenewingName:     renewingName,
+			RenewUID:         renewUID,
 		})
 		return
 	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Could not read account selection.", http.StatusBadRequest)
+		return
+	}
 
-	uid := r.FormValue("account_uid")
+	selectedUIDs := r.PostForm["account_uid"]
 	actualAccount := strings.TrimSpace(r.FormValue("actual_account"))
 	startDate := strings.TrimSpace(r.FormValue("start_sync_date"))
-	if uid == "" {
+	selected := make([]enablebanking.SessionAccount, 0, len(selectedUIDs))
+	selectedByUID := make(map[string]bool, len(selectedUIDs))
+	for _, uid := range selectedUIDs {
+		if selectedByUID[uid] {
+			continue
+		}
+		account, ok := findAccount(accounts, uid)
+		if !ok {
+			http.Error(w, "A selected account was not returned by this bank; start the connection again.", http.StatusBadRequest)
+			return
+		}
+		selectedByUID[uid] = true
+		selected = append(selected, account)
+	}
+	if len(selected) == 0 {
 		s.render(w, "pick_account.html", pickData{
 			Title:            "Select Account",
 			Accounts:         pickables,
@@ -864,52 +931,99 @@ func (s *Server) handlePickAccount(w http.ResponseWriter, r *http.Request) {
 			RenameSafe:       s.renameSafeBackend(),
 			Renewing:         isRenewal,
 			RenewingName:     renewingName,
+			RenewUID:         renewUID,
 			Error:            "Please select an account.",
 		})
 		return
 	}
-	chosen, offered := findAccount(accounts, uid)
-	if !offered {
-		http.Error(w, "The selected account is not one this bank returned; start the connection again.", http.StatusBadRequest)
-		return
-	}
 
+	connectedUIDs := make(map[string]bool)
 	if isRenewal {
+		renewUID := r.FormValue("renew_account_uid")
+		chosen, ok := findAccount(accounts, renewUID)
+		if !ok {
+			s.render(w, "pick_account.html", pickData{
+				Title: "Select Account", SessionID: sessionID, BankName: bankName,
+				BankCountry: bankCountry, Expiry: expiry, Accounts: pickables,
+				DefaultAccount: defaultAccount, DefaultStartDate: defaultStart,
+				BackendLabel: s.BackendLabel(), KnownAccounts: s.knownBudgetAccounts(),
+				RenameSafe: s.renameSafeBackend(), Renewing: true, RenewingName: renewingName,
+				RenewUID: renewUID,
+				Error:    "Choose which returned account belongs to the account being renewed.",
+			})
+			return
+		}
+		if !selectedByUID[renewUID] {
+			selected = append(selected, chosen)
+			selectedByUID[renewUID] = true
+		}
 		if err := s.st.RenewBankAccountSession(renewing.ID, renewalFrom(chosen, sessionID, expiry)); err != nil {
 			http.Error(w, "Failed to renew: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		s.clearPendingAuth()
-		http.Redirect(w, r, "/status", http.StatusFound)
-		return
+		connectedUIDs[chosen.EffectiveUID()] = true
 	}
-	if actualAccount == "" {
-		actualAccount = defaultAccount
+
+	// A bank can end a PSU's earlier session when a new one is authorised. Keep
+	// already connected accounts on this session whenever the bank returned a
+	// stable match, so adding a sibling account does not strand the old one.
+	for _, existing := range accountsBeforeAdd {
+		if !strings.EqualFold(strings.TrimSpace(existing.BankName), strings.TrimSpace(bankName)) ||
+			!strings.EqualFold(strings.TrimSpace(existing.BankCountry), strings.TrimSpace(bankCountry)) {
+			continue
+		}
+		matched, ok := matchAccountIdentity(existing, accounts)
+		if !ok {
+			continue
+		}
+		if err := s.st.RenewBankAccountSession(existing.ID, renewalFrom(matched, sessionID, expiry)); err != nil {
+			http.Error(w, "Failed to update a connected account: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		connectedUIDs[matched.EffectiveUID()] = true
 	}
-	if actualAccount == "" {
-		actualAccount = suggestedNameFor(accounts, uid, bankName)
-	}
-	if actualAccount == "" {
-		actualAccount = bankName
-	}
+
 	if startDate == "" {
 		startDate = defaultStart
 	}
 
-	if _, err := s.st.AddBankAccount(store.NewBankAccount{
-		SessionID:          sessionID,
-		AccountUID:         uid,
-		BankName:           bankName,
-		BankCountry:        bankCountry,
-		ActualAccount:      actualAccount,
-		StartSyncDate:      startDate,
-		SessionExpiry:      expiry,
-		IBAN:               chosen.IBAN,
-		Currency:           chosen.Currency,
-		IdentificationHash: chosen.IdentificationHash,
-	}); err != nil {
-		http.Error(w, "Failed to save: "+err.Error(), http.StatusInternalServerError)
-		return
+	for _, chosen := range selected {
+		uid := chosen.EffectiveUID()
+		if connectedUIDs[uid] {
+			continue
+		}
+		accountName := strings.TrimSpace(r.FormValue("actual_account[" + uid + "]"))
+		if _, supplied := r.PostForm["actual_account["+uid+"]"]; !supplied {
+			accountName = actualAccount
+		}
+		if accountName == "" {
+			accountName = chosen.SuggestedAccountName(bankName)
+		}
+		if accountName == "" {
+			accountName = bankName
+		}
+		accountStartDate := strings.TrimSpace(r.FormValue("start_sync_date[" + uid + "]"))
+		if _, supplied := r.PostForm["start_sync_date["+uid+"]"]; !supplied {
+			accountStartDate = startDate
+		}
+		if accountStartDate == "" {
+			accountStartDate = defaultStart
+		}
+		if _, err := s.st.AddBankAccount(store.NewBankAccount{
+			SessionID:          sessionID,
+			AccountUID:         uid,
+			BankName:           bankName,
+			BankCountry:        bankCountry,
+			ActualAccount:      accountName,
+			StartSyncDate:      accountStartDate,
+			SessionExpiry:      expiry,
+			IBAN:               chosen.IBAN,
+			Currency:           chosen.Currency,
+			IdentificationHash: chosen.IdentificationHash,
+		}); err != nil {
+			http.Error(w, "Failed to save: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	s.clearPendingAuth()
@@ -922,6 +1036,7 @@ func (s *Server) clearPendingAuth() {
 	for _, key := range []string{
 		"pending_auth_session_id", "pending_auth_accounts", "pending_auth_expiry",
 		"pending_auth_bank_name", "pending_auth_bank_country", "pending_auth_renew_account_id",
+		"pending_auth_renew_uid",
 	} {
 		_ = s.st.SetSetting(key, "")
 	}
